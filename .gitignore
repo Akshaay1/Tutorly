@@ -1,0 +1,25 @@
+# --- secrets (NEVER commit) ---
+.env
+rag/.env
+*.key
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+rag/.venv/
+*.egg-info/
+
+# --- large source PDFs (not needed to serve; index is prebuilt & committed) ---
+# To rebuild the index locally you still need these files present.
+*.pdf
+
+# --- build artifacts & caches (regenerated) ---
+rag/index_build_ckpt.npz
+rag/ocr_cache/
+rag/yt_cache/
+
+# --- os / editor ---
+.DS_Store
+.idea/
+.vscode/

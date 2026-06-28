@@ -1,0 +1,8 @@
+pypdf
+numpy
+python-dotenv
+google-genai
+groq
+fastapi
+uvicorn[standard]
+youtube-transcript-api

@@ -1,0 +1,19 @@
+# Render.com deployment config. Connect this repo at https://render.com
+# (New + → Blueprint) and Render reads this file automatically.
+#
+# After the first deploy, set the two secret env vars in the Render dashboard:
+#   GEMINI_API_KEY  and  GROQ_API_KEY   (Environment tab)
+services:
+  - type: web
+    name: build-your-own-tutor
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: cd app && uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: GEMINI_API_KEY
+        sync: false   # set the value in the dashboard (kept out of git)
+      - key: GROQ_API_KEY
+        sync: false
