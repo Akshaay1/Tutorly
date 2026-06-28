@@ -216,7 +216,6 @@ function renderSources() {
   state.videoUrl = "";
   state.videoId = null;
   const live = isIndexed(state.klass, state.subject, state.chapter);
-  const teacher = hasTeacher(state.klass, state.subject, state.chapter);
 
   swap(`
     <section class="view">
@@ -231,13 +230,6 @@ function renderSources() {
           <div><h4>NCERT Textbook</h4><p>${live ? "Official chapter text, cited to the exact page." : "Not indexed for this chapter yet."}</p></div>
           ${live ? '<span class="tick">✓</span>' : '<span class="soon">SOON</span>'}
         </div>
-
-        ${teacher ? `
-        <div class="source" data-src="teacher">
-          <span class="s-ic">📝</span>
-          <div><h4>Class Notes</h4><p>Your teacher's pre-loaded class video notes.</p></div>
-          <span class="tick">✓</span>
-        </div>` : ""}
 
         <div class="source" data-src="youtube">
           <span class="s-ic">🎬</span>
