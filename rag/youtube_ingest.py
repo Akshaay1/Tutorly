@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +27,15 @@ TRANSCRIPT_DIR.mkdir(exist_ok=True)
 
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 150
+RETRIES = 3              # youtube-transcript-api attempts
+BACKOFF_BASE = 2.0       # seconds; doubles each retry (2s, 4s)
 FIGURE_RE = re.compile(r"\bFig\.?\s*\d+|\bfigure\b|\bdiagram\b", re.IGNORECASE)
+
+# Failures where retrying is pointless (the video genuinely has no transcript).
+_PERMANENT = {
+    "TranscriptsDisabled", "NoTranscriptFound", "VideoUnavailable",
+    "VideoUnplayable", "InvalidVideoId", "AgeRestricted",
+}
 
 _ID_RE = re.compile(
     r"(?:v=|/shorts/|/embed/|youtu\.be/|/v/)([0-9A-Za-z_-]{11})"
@@ -87,63 +96,38 @@ def _proxy_url():
 
 
 def _try_once(api, video_id: str):
-    """One pass over language preferences; returns text or None."""
+    """One pass over language preferences; returns text or raises the last error."""
+    last = None
     for langs in (["en"], ["hi"], ["en", "hi"], None):
         try:
             fetched = api.fetch(video_id) if langs is None else api.fetch(video_id, languages=langs)
             text = " ".join(seg.text.strip() for seg in fetched if seg.text.strip())
             if text:
                 return text
-        except Exception:
-            continue
-    return None
+        except Exception as e:
+            last = e
+    if last is not None:
+        raise last
+    raise YoutubeError("Transcript was empty.")
 
 
-# ---- Tier 1: youtube-transcript-api (fast, free; proxy in cloud) ----
+# ---- Primary (free): youtube-transcript-api with retries + exponential backoff ----
 def _via_transcript_api(video_id):
-    try:
-        return _try_once(_build_api(), video_id)
-    except Exception:
-        return None
-
-
-# ---- Tier 2: yt-dlp subtitles (a different network path; no audio, no ffmpeg) ----
-def _parse_vtt(vtt: str) -> str:
-    out = []
-    for line in vtt.splitlines():
-        line = line.strip()
-        if (not line or line.startswith(("WEBVTT", "Kind:", "Language:", "NOTE"))
-                or "-->" in line or line.isdigit()):
-            continue
-        line = re.sub(r"<[^>]+>", "", line)        # strip inline timing tags
-        if line and (not out or out[-1] != line):  # drop consecutive duplicates
-            out.append(line)
-    return " ".join(out).strip()
-
-
-def _via_ytdlp_subs(video_id):
-    try:
-        import yt_dlp
-    except ImportError:
-        return None
-    tmp = Path(tempfile.mkdtemp(prefix="ytsub_"))
-    try:
-        opts = {
-            "skip_download": True, "writeautomaticsub": True, "writesubtitles": True,
-            "subtitleslangs": ["en", "en-US", "hi"], "subtitlesformat": "vtt",
-            "outtmpl": str(tmp / "%(id)s.%(ext)s"), "quiet": True, "no_warnings": True, "noprogress": True,
-        }
-        proxy = _proxy_url()
-        if proxy:
-            opts["proxy"] = proxy
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
-        vtts = sorted(tmp.glob("*.vtt"))
-        return _parse_vtt(vtts[0].read_text(encoding="utf-8", errors="ignore")) if vtts else None
-    except Exception:
-        return None
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    """Retries transient failures (blocked / network) with exponential backoff;
+    gives up immediately if the video truly has no captions. Returns text or None."""
+    delay = BACKOFF_BASE
+    for attempt in range(1, RETRIES + 1):
+        try:
+            return _try_once(_build_api(), video_id)
+        except Exception as e:
+            if type(e).__name__ in _PERMANENT:
+                return None  # no captions — retrying won't help
+            if attempt < RETRIES:
+                print(f"  transcript blocked/failed ({type(e).__name__}) — "
+                      f"retry {attempt}/{RETRIES - 1} in {delay:.0f}s…", flush=True)
+                time.sleep(delay)
+                delay *= 2
+    return None
 
 
 # ---- Tier 3 (optional): yt-dlp audio -> Groq Whisper (whisper-large-v3) ----
@@ -189,25 +173,28 @@ def _via_whisper(video_id):
 
 
 def _fetch_transcript(video_id: str) -> str:
-    """Cache-first, then fall through transcript sources until one works:
+    """Cache-first, free-first transcript fetch:
 
-        cache -> youtube-transcript-api -> yt-dlp subtitles -> (optional) Whisper
+        cache -> youtube-transcript-api (retries + backoff) -> (optional) Whisper
+
+    Each video is fetched at most once (then cached forever). If the free path
+    keeps failing on a datacenter IP, switch only this layer to a residential
+    proxy or hosted transcript API later — the rest of the app is unaffected.
     """
     cache = TRANSCRIPT_DIR / f"{video_id}.txt"
     if cache.exists():
         return cache.read_text(encoding="utf-8")
 
-    for source in (_via_transcript_api, _via_ytdlp_subs, _via_whisper):
+    for source in (_via_transcript_api, _via_whisper):
         text = source(video_id)
         if text and len(text.strip()) >= 40:
             text = text.strip()
-            cache.write_text(text, encoding="utf-8")   # cache forever on success
+            cache.write_text(text, encoding="utf-8")   # fetch each video only once
             return text
 
     raise YoutubeError(
-        "Couldn't get a transcript from captions or audio. The video may have no "
-        "captions, or YouTube blocked the server (add a residential proxy for cloud "
-        "hosting — see DEPLOY.md). Try a different video."
+        "Couldn't fetch this video's transcript right now. It may have no captions, "
+        "or YouTube is rate-limiting the server. Try again shortly, or a different video."
     )
 
 
