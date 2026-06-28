@@ -8,3 +8,4 @@ python-dotenv
 google-genai
 groq
 youtube-transcript-api
+yt-dlp

@@ -9,7 +9,10 @@ Used by the web server when a student pastes a video link at source-selection.
 """
 
 import json
+import os
 import re
+import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +21,8 @@ import rag_engine
 
 CACHE_DIR = Path(__file__).resolve().parent / "yt_cache"
 CACHE_DIR.mkdir(exist_ok=True)
+TRANSCRIPT_DIR = CACHE_DIR / "transcripts"   # raw transcripts, cached separately
+TRANSCRIPT_DIR.mkdir(exist_ok=True)
 
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 150
@@ -42,22 +47,167 @@ def parse_video_id(url: str) -> str:
     raise YoutubeError("Couldn't find a valid YouTube video id in that link.")
 
 
-def _fetch_transcript(video_id: str) -> str:
+def _build_api():
+    """Build a YouTubeTranscriptApi, routing through a residential proxy if
+    proxy credentials are set in the environment. This is what makes the feature
+    work in the cloud (Render/etc.), where YouTube blocks datacenter IPs.
+
+    - Locally (no env vars): direct connection, free.
+    - In the cloud: set WEBSHARE_PROXY_USERNAME + WEBSHARE_PROXY_PASSWORD
+      (Webshare residential), or a generic YT_HTTP_PROXY URL.
+    """
+    import os
     from youtube_transcript_api import YouTubeTranscriptApi
 
-    api = YouTubeTranscriptApi()
-    last_err = None
-    # prefer English, then Hindi, then whatever exists
+    ws_user = os.environ.get("WEBSHARE_PROXY_USERNAME")
+    ws_pass = os.environ.get("WEBSHARE_PROXY_PASSWORD")
+    if ws_user and ws_pass:
+        from youtube_transcript_api.proxies import WebshareProxyConfig
+        return YouTubeTranscriptApi(
+            proxy_config=WebshareProxyConfig(proxy_username=ws_user, proxy_password=ws_pass)
+        )
+
+    generic = os.environ.get("YT_HTTP_PROXY")  # e.g. http://user:pass@host:port
+    if generic:
+        from youtube_transcript_api.proxies import GenericProxyConfig
+        return YouTubeTranscriptApi(
+            proxy_config=GenericProxyConfig(http_url=generic, https_url=generic)
+        )
+
+    return YouTubeTranscriptApi()  # direct (local / has a residential IP)
+
+
+def _proxy_url():
+    """Proxy URL for yt-dlp / audio download, derived from the same env creds."""
+    user = os.environ.get("WEBSHARE_PROXY_USERNAME")
+    pw = os.environ.get("WEBSHARE_PROXY_PASSWORD")
+    if user and pw:
+        return f"http://{user}-rotate:{pw}@p.webshare.io:80"
+    return os.environ.get("YT_HTTP_PROXY")
+
+
+def _try_once(api, video_id: str):
+    """One pass over language preferences; returns text or None."""
     for langs in (["en"], ["hi"], ["en", "hi"], None):
         try:
             fetched = api.fetch(video_id) if langs is None else api.fetch(video_id, languages=langs)
-            return " ".join(seg.text.strip() for seg in fetched if seg.text.strip())
-        except Exception as e:  # NoTranscriptFound / TranscriptsDisabled / etc.
-            last_err = e
+            text = " ".join(seg.text.strip() for seg in fetched if seg.text.strip())
+            if text:
+                return text
+        except Exception:
             continue
+    return None
+
+
+# ---- Tier 1: youtube-transcript-api (fast, free; proxy in cloud) ----
+def _via_transcript_api(video_id):
+    try:
+        return _try_once(_build_api(), video_id)
+    except Exception:
+        return None
+
+
+# ---- Tier 2: yt-dlp subtitles (a different network path; no audio, no ffmpeg) ----
+def _parse_vtt(vtt: str) -> str:
+    out = []
+    for line in vtt.splitlines():
+        line = line.strip()
+        if (not line or line.startswith(("WEBVTT", "Kind:", "Language:", "NOTE"))
+                or "-->" in line or line.isdigit()):
+            continue
+        line = re.sub(r"<[^>]+>", "", line)        # strip inline timing tags
+        if line and (not out or out[-1] != line):  # drop consecutive duplicates
+            out.append(line)
+    return " ".join(out).strip()
+
+
+def _via_ytdlp_subs(video_id):
+    try:
+        import yt_dlp
+    except ImportError:
+        return None
+    tmp = Path(tempfile.mkdtemp(prefix="ytsub_"))
+    try:
+        opts = {
+            "skip_download": True, "writeautomaticsub": True, "writesubtitles": True,
+            "subtitleslangs": ["en", "en-US", "hi"], "subtitlesformat": "vtt",
+            "outtmpl": str(tmp / "%(id)s.%(ext)s"), "quiet": True, "no_warnings": True, "noprogress": True,
+        }
+        proxy = _proxy_url()
+        if proxy:
+            opts["proxy"] = proxy
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        vtts = sorted(tmp.glob("*.vtt"))
+        return _parse_vtt(vtts[0].read_text(encoding="utf-8", errors="ignore")) if vtts else None
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---- Tier 3 (optional): yt-dlp audio -> Groq Whisper (whisper-large-v3) ----
+def _whisper_enabled():
+    return os.environ.get("ENABLE_WHISPER", "").lower() in ("1", "true", "yes")
+
+
+def _via_whisper(video_id):
+    if not _whisper_enabled():
+        return None
+    try:
+        import yt_dlp
+    except ImportError:
+        return None
+    tmp = Path(tempfile.mkdtemp(prefix="ytaud_"))
+    try:
+        opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio",
+            "outtmpl": str(tmp / "%(id)s.%(ext)s"), "quiet": True, "no_warnings": True, "noprogress": True,
+        }
+        proxy = _proxy_url()
+        if proxy:
+            opts["proxy"] = proxy
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        files = [f for f in tmp.iterdir() if f.is_file()]
+        if not files:
+            return None
+        audio = files[0]
+        if audio.stat().st_size > 24 * 1024 * 1024:   # Groq Whisper ~25 MB upload limit
+            return None
+        from groq import Groq
+        client = Groq(api_key=os.environ["GROQ_API_KEY"])
+        with open(audio, "rb") as fh:
+            resp = client.audio.transcriptions.create(
+                file=(audio.name, fh.read()), model="whisper-large-v3",
+            )
+        return (resp.text or "").strip() or None
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _fetch_transcript(video_id: str) -> str:
+    """Cache-first, then fall through transcript sources until one works:
+
+        cache -> youtube-transcript-api -> yt-dlp subtitles -> (optional) Whisper
+    """
+    cache = TRANSCRIPT_DIR / f"{video_id}.txt"
+    if cache.exists():
+        return cache.read_text(encoding="utf-8")
+
+    for source in (_via_transcript_api, _via_ytdlp_subs, _via_whisper):
+        text = source(video_id)
+        if text and len(text.strip()) >= 40:
+            text = text.strip()
+            cache.write_text(text, encoding="utf-8")   # cache forever on success
+            return text
+
     raise YoutubeError(
-        "No usable transcript for this video (captions may be disabled). "
-        f"Details: {type(last_err).__name__}"
+        "Couldn't get a transcript from captions or audio. The video may have no "
+        "captions, or YouTube blocked the server (add a residential proxy for cloud "
+        "hosting — see DEPLOY.md). Try a different video."
     )
 
 
